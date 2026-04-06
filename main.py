@@ -25,16 +25,46 @@ ST_COMPLETIONS_URL = os.environ.get("ST_COMPLETIONS_URL", "").strip()
 # SillyTavern config.yaml basicAuthUser (HTTP Basic Auth in front of the whole site)
 ST_BASIC_AUTH_USER = os.environ.get("ST_BASIC_AUTH_USER", "").strip()
 ST_BASIC_AUTH_PASSWORD = os.environ.get("ST_BASIC_AUTH_PASSWORD", "").strip()
+# Some reverse proxies return 403 for python-httpx; override if needed
+ST_USER_AGENT = os.environ.get("ST_USER_AGENT", "").strip()
+# If 403 persists, try "true" (some stacks reject Origin on API POST)
+ST_SKIP_ORIGIN_HEADERS = os.environ.get("ST_SKIP_ORIGIN_HEADERS", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 # Zeabur injects ZEABUR_WEB_URL for the deployed service (Git → port "web")
 WEBHOOK_URL = (
     os.environ.get("WEBHOOK_URL") or os.environ.get("ZEABUR_WEB_URL", "")
 ).rstrip("/")
+
+_DEFAULT_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 
 def _st_http_basic_auth() -> httpx.Auth | None:
     if not ST_BASIC_AUTH_USER and not ST_BASIC_AUTH_PASSWORD:
         return None
     return httpx.BasicAuth(ST_BASIC_AUTH_USER, ST_BASIC_AUTH_PASSWORD)
+
+
+def _st_extra_headers() -> dict[str, str]:
+    """Avoid 403 from stacks that block non-browser User-Agents or expect same-origin hints."""
+    ua = ST_USER_AGENT or _DEFAULT_BROWSER_UA
+    h: dict[str, str] = {
+        "User-Agent": ua,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if ST_URL and not ST_SKIP_ORIGIN_HEADERS:
+        p = urlparse(ST_URL if "://" in ST_URL else f"https://{ST_URL}")
+        if p.scheme and p.netloc:
+            origin = f"{p.scheme}://{p.netloc}"
+            h["Origin"] = origin
+            h["Referer"] = f"{origin}/"
+    return h
 
 
 def _st_openai_base() -> str:
@@ -77,7 +107,7 @@ def _extract_openai_reply(data: dict) -> str | None:
 async def _post_chat_completions(
     client: httpx.AsyncClient, url: str, user_message: str, use_bearer: bool
 ) -> httpx.Response:
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", **_st_extra_headers()}
     if use_bearer and CHATBRIDGE_API_KEY.strip():
         headers["Authorization"] = f"Bearer {CHATBRIDGE_API_KEY.strip()}"
     return await client.post(
@@ -145,6 +175,14 @@ async def send_to_sillytavern(user_message: str) -> str:
                             "ST_BASIC_AUTH_PASSWORD to match config.yaml basicAuthUser.",
                             openai_endpoint,
                         )
+                    elif resp.status_code == 403:
+                        logger.warning(
+                            "ST POST %s -> 403 Forbidden. Often: reverse proxy/WAF blocking "
+                            "non-browser clients (we now send a browser User-Agent), wrong "
+                            "route for POST, or IP allowlist. Body=%s",
+                            openai_endpoint,
+                            snippet,
+                        )
                     else:
                         logger.warning(
                             "ST POST %s -> HTTP %s body=%s",
@@ -179,7 +217,7 @@ async def send_to_sillytavern(user_message: str) -> str:
                     resp = await client.post(
                         legacy,
                         json=payload,
-                        headers={"Content-Type": "application/json"},
+                        headers={"Content-Type": "application/json", **_st_extra_headers()},
                     )
                     if resp.status_code == 200:
                         data = resp.json()
