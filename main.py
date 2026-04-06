@@ -1,48 +1,40 @@
-from fastapi import FastAPI, Request
-import httpx
-import os
-import json
-
-app = FastAPI()
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-ST_URL = os.getenv("ST_URL").rstrip("/")  # e.g. https://japanese.zeabur.app
-CHARACTER_NAME = os.getenv("CHARACTER_NAME", "Haruka")  # your character name
-
-async def send_to_sillytavern(message: str, user_id: str):
-    payload = {
-        "input": message,
-        "character": CHARACTER_NAME,
-        "user": "Nano"  # your user name
-    }
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(f"{ST_URL}/api/chat", json=payload, timeout=120)
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get("response", "Sorry, I didn't get that 💦")
-    return "Error connecting to SillyTavern 😵"
-
-@app.post("/webhook")
-async def telegram_webhook(request: Request):
-    data = await request.json()
-    if "message" in data:
-        msg = data["message"]
-        text = msg.get("text")
-        chat_id = msg["chat"]["id"]
-        
-        if text and text.startswith("/"):
-            # handle commands if you want
-            pass
-        elif text:
-            reply = await send_to_sillytavern(text, str(chat_id))
-            # send reply back to Telegram
-            async with httpx.AsyncClient() as client:
-                await client.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                    json={"chat_id": chat_id, "text": reply}
+async def send_to_sillytavern(user_message: str):
+    # Try the most common ways SillyTavern accepts external messages
+    payloads = [
+        # Method 1: Simple chat endpoint (some forks / extensions use this)
+        {
+            "input": user_message,
+            "character": CHARACTER_NAME,
+            "user": USER_NAME
+        },
+        # Method 2: More standard prompt-style
+        {
+            "prompt": user_message,
+            "character": CHARACTER_NAME,
+            "user": USER_NAME,
+            "max_new_tokens": 300,
+            "temperature": 0.85
+        }
+    ]
+    
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        for payload in payloads:
+            try:
+                resp = await client.post(
+                    urljoin(ST_URL, "/api/chat"), 
+                    json=payload,
+                    headers={"Content-Type": "application/json"}
                 )
-    return {"status": "ok"}
-
-@app.get("/")
-async def root():
-    return {"status": "SillyTavern Telegram bridge is running"}
+                if resp.status_code == 200:
+                    data = resp.json()
+                    # Try different possible response keys
+                    reply = (data.get("response") or 
+                            data.get("result") or 
+                            data.get("text") or 
+                            str(data))
+                    return reply if len(reply) > 5 else "……ちょっと待ってね💦"
+            except:
+                continue  # try next payload format
+                
+        # If all failed, fallback message
+        return "ごめん、今ちょっと接続が不安定みたい……もう一度言ってみて？"
