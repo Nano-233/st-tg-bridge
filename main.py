@@ -20,6 +20,8 @@ CHATBRIDGE_API_KEY = os.environ.get("CHATBRIDGE_API_KEY", "your-user-api-key")
 CHARACTER_NAME = os.environ.get("CHARACTER_NAME", "")
 USER_NAME = os.environ.get("USER_NAME", "TelegramUser")
 ST_MODEL = os.environ.get("ST_MODEL", "gpt-3.5-turbo")
+# Full URL override if your reverse proxy does not use .../v1/chat/completions
+ST_COMPLETIONS_URL = os.environ.get("ST_COMPLETIONS_URL", "").strip()
 # Zeabur injects ZEABUR_WEB_URL for the deployed service (Git → port "web")
 WEBHOOK_URL = (
     os.environ.get("WEBHOOK_URL") or os.environ.get("ZEABUR_WEB_URL", "")
@@ -42,42 +44,97 @@ def _legacy_api_chat_url() -> str | None:
     return urlunparse((p.scheme, p.netloc, "/api/chat", "", "", ""))
 
 
+def _extract_openai_reply(data: dict) -> str | None:
+    if not isinstance(data, dict):
+        return None
+    err = data.get("error")
+    if err:
+        logger.warning("Upstream returned error field: %s", err)
+    choices = data.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return None
+    c0 = choices[0]
+    msg = c0.get("message")
+    if isinstance(msg, dict):
+        content = msg.get("content")
+        if content is not None and str(content).strip():
+            return str(content)
+    text = c0.get("text")
+    if text is not None and str(text).strip():
+        return str(text)
+    return None
+
+
+async def _post_chat_completions(
+    client: httpx.AsyncClient, url: str, user_message: str, use_bearer: bool
+) -> httpx.Response:
+    headers = {"Content-Type": "application/json"}
+    if use_bearer and CHATBRIDGE_API_KEY.strip():
+        headers["Authorization"] = f"Bearer {CHATBRIDGE_API_KEY.strip()}"
+    return await client.post(
+        url,
+        json={
+            "model": ST_MODEL,
+            "messages": [{"role": "user", "content": user_message}],
+            "stream": False,
+        },
+        headers=headers,
+    )
+
+
 async def send_to_sillytavern(user_message: str) -> str:
-    async with httpx.AsyncClient(timeout=90.0) as client:
+    async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as client:
         # 1) SillyTavern Extension ChatBridge (OpenAI-compatible)
-        st_openai = _st_openai_base()
-        if st_openai:
-            openai_endpoint = f"{st_openai}/chat/completions"
-            try:
-                resp = await client.post(
-                    openai_endpoint,
-                    json={
-                        "model": ST_MODEL,
-                        "messages": [{"role": "user", "content": user_message}],
-                        "stream": False,
-                    },
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {CHATBRIDGE_API_KEY}",
-                    },
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    choices = data.get("choices") or []
-                    if choices:
-                        msg = choices[0].get("message") or {}
-                        content = msg.get("content")
-                        if content and len(str(content).strip()) > 0:
-                            return str(content)
-                elif resp.status_code not in (404, 405):
+        if ST_COMPLETIONS_URL:
+            openai_urls = [ST_COMPLETIONS_URL]
+        else:
+            st_openai = _st_openai_base()
+            openai_urls = [f"{st_openai}/chat/completions"] if st_openai else []
+
+        for openai_endpoint in openai_urls:
+            for use_bearer in (True, False):
+                if not use_bearer and not CHATBRIDGE_API_KEY.strip():
+                    break
+                try:
+                    resp = await _post_chat_completions(
+                        client, openai_endpoint, user_message, use_bearer
+                    )
+                    if resp.status_code == 200:
+                        try:
+                            data = resp.json()
+                        except Exception:
+                            logger.warning(
+                                "ST 200 but not JSON from %s: %s",
+                                openai_endpoint,
+                                resp.text[:400],
+                            )
+                            break
+                        reply = _extract_openai_reply(data)
+                        if reply:
+                            return reply
+                        logger.warning(
+                            "ST 200 but no usable reply from %s; keys=%s snippet=%s",
+                            openai_endpoint,
+                            list(data.keys()) if isinstance(data, dict) else type(data),
+                            str(data)[:500],
+                        )
+                        break
+                    if resp.status_code == 401 and use_bearer:
+                        logger.info(
+                            "401 from %s with Bearer; retrying without Authorization",
+                            openai_endpoint,
+                        )
+                        continue
                     logger.warning(
-                        "ChatBridge-style POST %s -> %s %s",
+                        "ST POST %s -> HTTP %s body=%s",
                         openai_endpoint,
                         resp.status_code,
-                        resp.text[:200],
+                        resp.text[:500],
                     )
-            except Exception:
-                logger.exception("ChatBridge request failed for %s", openai_endpoint)
+                    break
+                except Exception:
+                    logger.exception("ChatBridge request failed for %s", openai_endpoint)
+                    break
 
         # 2) Some setups expose /api/chat on the server origin (not /v1)
         payloads = [
