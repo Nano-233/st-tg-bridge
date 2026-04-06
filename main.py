@@ -22,10 +22,19 @@ USER_NAME = os.environ.get("USER_NAME", "TelegramUser")
 ST_MODEL = os.environ.get("ST_MODEL", "gpt-3.5-turbo")
 # Full URL override if your reverse proxy does not use .../v1/chat/completions
 ST_COMPLETIONS_URL = os.environ.get("ST_COMPLETIONS_URL", "").strip()
+# SillyTavern config.yaml basicAuthUser (HTTP Basic Auth in front of the whole site)
+ST_BASIC_AUTH_USER = os.environ.get("ST_BASIC_AUTH_USER", "").strip()
+ST_BASIC_AUTH_PASSWORD = os.environ.get("ST_BASIC_AUTH_PASSWORD", "").strip()
 # Zeabur injects ZEABUR_WEB_URL for the deployed service (Git → port "web")
 WEBHOOK_URL = (
     os.environ.get("WEBHOOK_URL") or os.environ.get("ZEABUR_WEB_URL", "")
 ).rstrip("/")
+
+
+def _st_http_basic_auth() -> httpx.Auth | None:
+    if not ST_BASIC_AUTH_USER and not ST_BASIC_AUTH_PASSWORD:
+        return None
+    return httpx.BasicAuth(ST_BASIC_AUTH_USER, ST_BASIC_AUTH_PASSWORD)
 
 
 def _st_openai_base() -> str:
@@ -83,7 +92,10 @@ async def _post_chat_completions(
 
 
 async def send_to_sillytavern(user_message: str) -> str:
-    async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as client:
+    basic = _st_http_basic_auth()
+    async with httpx.AsyncClient(
+        timeout=90.0, follow_redirects=True, auth=basic
+    ) as client:
         # 1) SillyTavern Extension ChatBridge (OpenAI-compatible)
         if ST_COMPLETIONS_URL:
             openai_urls = [ST_COMPLETIONS_URL]
@@ -125,12 +137,21 @@ async def send_to_sillytavern(user_message: str) -> str:
                             openai_endpoint,
                         )
                         continue
-                    logger.warning(
-                        "ST POST %s -> HTTP %s body=%s",
-                        openai_endpoint,
-                        resp.status_code,
-                        resp.text[:500],
-                    )
+                    snippet = resp.text[:500]
+                    if resp.status_code == 401 and "basicAuthUser" in resp.text:
+                        logger.warning(
+                            "ST POST %s -> 401 (SillyTavern HTTP Basic Auth). "
+                            "Set Zeabur secrets ST_BASIC_AUTH_USER and "
+                            "ST_BASIC_AUTH_PASSWORD to match config.yaml basicAuthUser.",
+                            openai_endpoint,
+                        )
+                    else:
+                        logger.warning(
+                            "ST POST %s -> HTTP %s body=%s",
+                            openai_endpoint,
+                            resp.status_code,
+                            snippet,
+                        )
                     break
                 except Exception:
                     logger.exception("ChatBridge request failed for %s", openai_endpoint)
